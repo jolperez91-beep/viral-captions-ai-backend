@@ -133,7 +133,10 @@ app.post('/api/transcribe', upload.single('video'), async (req, res) => {
     // enum de códigos ISO (es, en, pt, fr...) y es más estricto con un
     // valor null explícito que con la clave simplemente ausente.
     const language = req.body.language && req.body.language !== 'auto' ? req.body.language : undefined;
-    const input = { audio_url: audioUrl, chunk_level: 'word' };
+    // OJO: fal-ai/wizper solo acepta chunk_level: 'segment' (NO 'word',
+    // aunque cierta documentación lo sugiera) — el detalle de error de fal
+    // lo confirmó: "Input should be 'segment'".
+    const input = { audio_url: audioUrl, chunk_level: 'segment' };
     if(language) input.language = language;
 
     const result = await fal.subscribe('fal-ai/wizper', { input, logs: false });
