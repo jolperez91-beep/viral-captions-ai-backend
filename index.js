@@ -110,18 +110,26 @@ app.post('/api/transcribe', upload.single('video'), async (req, res) => {
     const audioUrl = await fal.storage.upload(blob);
 
     // 3. Transcribe con timestamps por palabra
-    const language = req.body.language && req.body.language !== 'auto' ? req.body.language : null;
-    const result = await fal.subscribe('fal-ai/wizper', {
-      input: { audio_url: audioUrl, chunk_level: 'word', language },
-      logs: false
-    });
+    // OJO: si no hay idioma, hay que OMITIR la clave por completo (no mandar
+    // "language: null") — el esquema de fal.ai valida "language" como un
+    // enum de códigos ISO (es, en, pt, fr...) y es más estricto con un
+    // valor null explícito que con la clave simplemente ausente.
+    const language = req.body.language && req.body.language !== 'auto' ? req.body.language : undefined;
+    const input = { audio_url: audioUrl, chunk_level: 'word' };
+    if(language) input.language = language;
+
+    const result = await fal.subscribe('fal-ai/wizper', { input, logs: false });
 
     res.json({ chunks: result.data.chunks || [], text: result.data.text || '' });
   } catch (err) {
-    console.error('Error en /api/transcribe:', err);
+    // fal.ai devuelve errores de validación (422) con un array "detail" con
+    // el campo exacto que falló — lo mostramos completo en los Logs de Render
+    // en vez de solo "[Object]", para poder diagnosticar sin adivinar.
+    const validationDetail = err && err.body && err.body.detail ? JSON.stringify(err.body.detail) : null;
+    console.error('Error en /api/transcribe:', validationDetail || (err && err.message) || err);
     res.status(500).json({
       error: 'No se pudo generar la transcripcion.',
-      detail: String(err && err.message ? err.message : err)
+      detail: validationDetail || String(err && err.message ? err.message : err)
     });
   } finally {
     if(tmpDir) fs.rm(tmpDir, { recursive: true, force: true }, () => {});
