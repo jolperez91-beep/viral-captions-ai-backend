@@ -11,9 +11,16 @@
  *     por palabra a fal-ai/wizper -> devuelve el JSON.
  *
  *   POST /api/export
- *     Recibe el video completo + los subtitulos (JSON) -> quema el texto
- *     directamente en el video con FFmpeg (drawtext) -> devuelve el
- *     archivo .mp4 final para descargar.
+ *     Recibe el video completo + los subtitulos (JSON) -> genera cada
+ *     subtitulo como una IMAGEN PNG (con "sharp", renderizando texto vía
+ *     SVG) y las superpone sobre el video con el filtro "overlay" de
+ *     FFmpeg -> devuelve el archivo .mp4 final.
+ *
+ *     Nota tecnica: NO usamos el filtro "drawtext" de FFmpeg porque
+ *     requiere que el binario este compilado con libfreetype, algo que
+ *     varios builds estaticos (incluido el que probamos primero) NO
+ *     traen, y es dificil de garantizar de antemano. "overlay" en cambio
+ *     esta presente en absolutamente cualquier build de FFmpeg.
  *
  * DEPLOY EN RENDER (igual que antes):
  *   Build command:  npm install
@@ -33,6 +40,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+const sharp = require('sharp');
 const { fal } = require('@fal-ai/client');
 
 const app = express();
@@ -86,7 +94,7 @@ async function getFfmpegPath(){
     const binPath = path.join(binDir, 'ffmpeg');
     if(fs.existsSync(binPath)){ cachedFfmpegPath = binPath; return binPath; }
 
-    console.log('Descargando build completo de FFmpeg (con soporte de texto/drawtext)…');
+    console.log('Descargando build completo de FFmpeg…');
     const tarPath = path.join(os.tmpdir(), 'ffmpeg-release-amd64-static.tar.xz');
     const response = await fetch('https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz');
     if(!response.ok) throw new Error(`No se pudo descargar FFmpeg completo (status ${response.status}).`);
@@ -112,6 +120,35 @@ async function getFfmpegPath(){
   }
 }
 
+/** ffprobe viene en el mismo paquete descargado que ffmpeg — se usa para saber el tamaño del video. */
+async function getFfprobePath(){
+  const ffmpegPath = await getFfmpegPath();
+  return path.join(path.dirname(ffmpegPath), 'ffprobe');
+}
+
+/**
+ * Genera UNA imagen PNG transparente (del tamaño exacto del video) con el
+ * texto del subtítulo dibujado, usando SVG + sharp. Esto reemplaza a
+ * "drawtext" — sharp es mucho más portable y no depende de que FFmpeg
+ * tenga compilado el soporte de texto.
+ */
+async function renderCaptionPNG(text, width, height, fontSize, fontColorHex){
+  const clean = String(text).toUpperCase().trim();
+  // Si la línea es muy larga, reduce el tamaño para que no se salga del cuadro
+  const adjustedSize = clean.length > 22 ? Math.round(fontSize * 0.68) : fontSize;
+  const escaped = clean.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const strokeWidth = Math.max(2, Math.round(adjustedSize * 0.08));
+  const svg = `
+    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <text x="50%" y="${Math.round(height * 0.78)}" text-anchor="middle" dominant-baseline="middle"
+        font-family="DejaVu Sans, Liberation Sans, Arial, sans-serif" font-weight="900"
+        font-size="${adjustedSize}" fill="#${fontColorHex}"
+        stroke="#000000" stroke-width="${strokeWidth}" paint-order="stroke">${escaped}</text>
+    </svg>`;
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+
 /** Corre el binario de FFmpeg (descargándolo primero si hace falta) con los argumentos dados. */
 async function runFFmpeg(args){
   const ffmpegPath = await getFfmpegPath();
@@ -121,30 +158,6 @@ async function runFFmpeg(args){
       resolve();
     });
   });
-}
-
-/** Descarga (una sola vez, se cachea en /tmp) la fuente usada para quemar los subtitulos. */
-let cachedFontPath = null;
-async function getFontPath(){
-  if(cachedFontPath && fs.existsSync(cachedFontPath)) return cachedFontPath;
-  // OJO: jsdelivr NO puede servir archivos individuales del repo google/fonts
-  // porque es demasiado grande para su CDN (devuelve 404). raw.githubusercontent.com
-  // sirve el archivo directo sin importar el tamaño del repo.
-  const response = await fetch('https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Bold.ttf');
-  if(!response.ok) throw new Error(`No se pudo descargar la fuente para los subtitulos (status ${response.status}).`);
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const fontPath = path.join(os.tmpdir(), 'poppins-bold.ttf');
-  fs.writeFileSync(fontPath, buffer);
-  cachedFontPath = fontPath;
-  return fontPath;
-}
-
-/** Escapa texto para que el filtro drawtext de FFmpeg no se rompa. */
-function escapeForDrawtext(text){
-  return String(text)
-    .replace(/\\/g, '\\\\')
-    .replace(/:/g, '\\:')
-    .replace(/'/g, '\u2019');
 }
 
 /* ------------------------------------------------------------------ */
@@ -205,7 +218,7 @@ app.post('/api/transcribe', upload.single('video'), async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* POST /api/export -- video + subtitulos -> FFmpeg (drawtext) -> .mp4 */
+/* POST /api/export -- video + subtitulos -> imagenes + overlay -> .mp4 */
 /* ------------------------------------------------------------------ */
 app.post('/api/export', upload.single('video'), async (req, res) => {
   let tmpDir;
@@ -229,19 +242,55 @@ app.post('/api/export', upload.single('video'), async (req, res) => {
     const outputPath = path.join(tmpDir, 'output.mp4');
     fs.writeFileSync(inputPath, req.file.buffer);
 
-    const fontPath = await getFontPath();
-    console.log('Fuente lista en:', fontPath);
+    const ffprobePath = await getFfprobePath();
+    console.log('Detectando resolución del video…');
+    const { width, height } = await new Promise((resolve, reject) => {
+      execFile(ffprobePath, [
+        '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', inputPath
+      ], (err, stdout) => {
+        if(err) return reject(new Error('No se pudo leer el video: ' + err.message));
+        const [w, h] = stdout.trim().split('x').map(Number);
+        if(!w || !h) return reject(new Error('No se pudo determinar el tamaño del video.'));
+        resolve({ width: w, height: h });
+      });
+    });
+    console.log(`Resolución detectada: ${width}x${height}`);
 
-    // transcript llega como [{ text, start, end }] con start/end en SEGUNDOS
-    const filters = transcript.map(row => {
-      const text = escapeForDrawtext(String(row.text || '').toUpperCase());
+    console.log(`Generando ${transcript.length} imágenes de subtítulos…`);
+    const overlays = [];
+    for(let i = 0; i < transcript.length; i++){
+      const row = transcript[i];
+      const text = String(row.text || '').trim();
+      if(!text) continue;
+      const pngBuffer = await renderCaptionPNG(text, width, height, fontSize, fontColor);
+      const pngPath = path.join(tmpDir, `cap_${i}.png`);
+      fs.writeFileSync(pngPath, pngBuffer);
       const start = Number(row.start) || 0;
-      const end = Number(row.end) || start + 1.5;
-      return `drawtext=fontfile=${fontPath}:text='${text}':fontcolor=0x${fontColor}:fontsize=${fontSize}:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h*0.78:enable='between(t,${start},${end})'`;
-    }).join(',');
+      overlays.push({ path: pngPath, start, end: Number(row.end) || start + 1.5 });
+    }
+    if(!overlays.length){
+      return res.status(400).json({ error: 'No hay texto válido en los subtítulos.' });
+    }
 
-    console.log(`Quemando ${transcript.length} líneas de subtítulos con FFmpeg…`);
-    await runFFmpeg(['-y', '-i', inputPath, '-vf', filters, '-c:a', 'copy', outputPath]);
+    // input 0 = video; inputs 1..N = una imagen PNG transparente por línea de subtítulo
+    const args = ['-y', '-i', inputPath];
+    overlays.forEach(o => args.push('-i', o.path));
+
+    let filter = '';
+    let lastLabel = '0:v';
+    overlays.forEach((o, i) => {
+      const inputIdx = i + 1;
+      const outLabel = i === overlays.length - 1 ? 'vout' : `v${i}`;
+      filter += `[${lastLabel}][${inputIdx}:v]overlay=0:0:enable='between(t,${o.start},${o.end})'[${outLabel}];`;
+      lastLabel = outLabel;
+    });
+    filter = filter.slice(0, -1); // quita el ";" final
+
+    args.push('-filter_complex', filter, '-map', '[vout]', '-map', '0:a?', '-c:a', 'copy', outputPath);
+
+    console.log('Superponiendo subtítulos con FFmpeg (overlay)…');
+    await runFFmpeg(args);
     console.log('FFmpeg terminó OK, enviando el archivo…');
 
     res.setHeader('Content-Type', 'video/mp4');
