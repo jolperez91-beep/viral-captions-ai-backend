@@ -83,8 +83,11 @@ function runFFmpeg(args){
 let cachedFontPath = null;
 async function getFontPath(){
   if(cachedFontPath && fs.existsSync(cachedFontPath)) return cachedFontPath;
-  const response = await fetch('https://cdn.jsdelivr.net/gh/google/fonts/ofl/poppins/Poppins-Bold.ttf');
-  if(!response.ok) throw new Error('No se pudo descargar la fuente para los subtitulos.');
+  // OJO: jsdelivr NO puede servir archivos individuales del repo google/fonts
+  // porque es demasiado grande para su CDN (devuelve 404). raw.githubusercontent.com
+  // sirve el archivo directo sin importar el tamaño del repo.
+  const response = await fetch('https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Bold.ttf');
+  if(!response.ok) throw new Error(`No se pudo descargar la fuente para los subtitulos (status ${response.status}).`);
   const buffer = Buffer.from(await response.arrayBuffer());
   const fontPath = path.join(os.tmpdir(), 'poppins-bold.ttf');
   fs.writeFileSync(fontPath, buffer);
