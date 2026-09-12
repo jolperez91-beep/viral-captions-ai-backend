@@ -33,7 +33,6 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
 const { fal } = require('@fal-ai/client');
 
 const app = express();
@@ -69,8 +68,53 @@ app.get('/', (req, res) => {
   res.send('Viral Captions AI — backend activo. Endpoints: POST /api/transcribe, POST /api/export');
 });
 
-/** Corre el binario de FFmpeg con los argumentos dados. */
-function runFFmpeg(args){
+/**
+ * Descarga (una sola vez por instancia, se cachea en /tmp) un build COMPLETO
+ * de FFmpeg — el paquete npm "ffmpeg-static" trae un binario recortado que
+ * NO incluye libfreetype, por lo que el filtro "drawtext" falla con
+ * "No such filter: 'drawtext'". Este build (John Van Sickle, el mismo usado
+ * en incontables Dockerfiles) sí lo incluye, confirmado.
+ */
+let cachedFfmpegPath = null;
+let ffmpegDownloadPromise = null;
+async function getFfmpegPath(){
+  if(cachedFfmpegPath && fs.existsSync(cachedFfmpegPath)) return cachedFfmpegPath;
+  if(ffmpegDownloadPromise) return ffmpegDownloadPromise;
+
+  ffmpegDownloadPromise = (async () => {
+    const binDir = path.join(os.tmpdir(), 'ffmpeg-full');
+    const binPath = path.join(binDir, 'ffmpeg');
+    if(fs.existsSync(binPath)){ cachedFfmpegPath = binPath; return binPath; }
+
+    console.log('Descargando build completo de FFmpeg (con soporte de texto/drawtext)…');
+    const tarPath = path.join(os.tmpdir(), 'ffmpeg-release-amd64-static.tar.xz');
+    const response = await fetch('https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz');
+    if(!response.ok) throw new Error(`No se pudo descargar FFmpeg completo (status ${response.status}).`);
+    fs.writeFileSync(tarPath, Buffer.from(await response.arrayBuffer()));
+
+    fs.mkdirSync(binDir, { recursive: true });
+    await new Promise((resolve, reject) => {
+      execFile('tar', ['-xJf', tarPath, '-C', binDir, '--strip-components=1'], (err, stdout, stderr) => {
+        if(err) return reject(new Error('No se pudo extraer FFmpeg: ' + (stderr || err.message)));
+        resolve();
+      });
+    });
+    fs.chmodSync(binPath, 0o755);
+    console.log('FFmpeg completo listo en:', binPath);
+    cachedFfmpegPath = binPath;
+    return binPath;
+  })();
+
+  try {
+    return await ffmpegDownloadPromise;
+  } finally {
+    ffmpegDownloadPromise = null;
+  }
+}
+
+/** Corre el binario de FFmpeg (descargándolo primero si hace falta) con los argumentos dados. */
+async function runFFmpeg(args){
+  const ffmpegPath = await getFfmpegPath();
   return new Promise((resolve, reject) => {
     execFile(ffmpegPath, args, { maxBuffer: 1024 * 1024 * 100 }, (err, stdout, stderr) => {
       if(err) return reject(new Error((stderr && stderr.slice(-800)) || err.message));
