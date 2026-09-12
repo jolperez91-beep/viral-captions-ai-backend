@@ -166,6 +166,7 @@ app.post('/api/export', upload.single('video'), async (req, res) => {
     if(!req.file){
       return res.status(400).json({ error: 'No se recibio ningun video (campo "video").' });
     }
+    console.log(`Export: video recibido ${req.file.originalname || '(sin nombre)'} — ${(req.file.size / 1024 / 1024).toFixed(2)} MB`);
     let transcript;
     try { transcript = JSON.parse(req.body.transcript || '[]'); }
     catch { return res.status(400).json({ error: 'El campo "transcript" no es un JSON valido.' }); }
@@ -182,6 +183,7 @@ app.post('/api/export', upload.single('video'), async (req, res) => {
     fs.writeFileSync(inputPath, req.file.buffer);
 
     const fontPath = await getFontPath();
+    console.log('Fuente lista en:', fontPath);
 
     // transcript llega como [{ text, start, end }] con start/end en SEGUNDOS
     const filters = transcript.map(row => {
@@ -191,7 +193,9 @@ app.post('/api/export', upload.single('video'), async (req, res) => {
       return `drawtext=fontfile=${fontPath}:text='${text}':fontcolor=0x${fontColor}:fontsize=${fontSize}:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h*0.78:enable='between(t,${start},${end})'`;
     }).join(',');
 
+    console.log(`Quemando ${transcript.length} líneas de subtítulos con FFmpeg…`);
     await runFFmpeg(['-y', '-i', inputPath, '-vf', filters, '-c:a', 'copy', outputPath]);
+    console.log('FFmpeg terminó OK, enviando el archivo…');
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', 'attachment; filename="viral-captions-ai.mp4"');
